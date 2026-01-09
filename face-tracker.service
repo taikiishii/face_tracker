@@ -1,0 +1,20 @@
+[Unit]
+Description=Face Tracker with Servo Control
+After=sysinit.target
+# USBデバイス（カメラ・サーボ）が利用可能になってから起動
+
+[Service]
+Type=simple
+User=taiki
+WorkingDirectory=/home/taiki/Documents/face_tracker
+ExecStart=/home/taiki/Documents/face_tracker/venv/bin/python /home/taiki/Documents/face_tracker/face_tracker.py --no-display
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# サーボのシリアルポートへのアクセス権限
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target
