@@ -6,6 +6,7 @@
 
 - **プラットフォーム**: Raspberry Pi 5
 - **カメラ**: USB Webカメラ
+  - InnoMaker 1080P USB2.0 UVCカメラ、130°広角レンズ
 - **サーボモーター**: Feetech STS3215（3軸）
   - ID 1: パン（左右）
   - ID 2: ロール（回転）
