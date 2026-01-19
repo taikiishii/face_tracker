@@ -182,6 +182,9 @@ sudo systemctl status face-tracker
 # ログをリアルタイム表示
 sudo journalctl -u face-tracker -f
 
+# 自動起動を有効化
+sudo systemctl enable face-tracker
+
 # 自動起動を無効化
 sudo systemctl disable face-tracker
 ```

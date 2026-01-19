@@ -27,6 +27,9 @@ class ServoController:
     # 角度範囲（±50度 = ±568 steps、STS3215は1 step = 0.088度）
     ANGLE_RANGE = 568  # 50度 / 0.088度 ≈ 568 steps
     
+    # 負荷制限（可動範囲制限の検出）
+    MAX_LOAD_THRESHOLD = 80.0  # 負荷が80%を超えたら可動範囲の限界とみなす
+    
     def __init__(self, port='/dev/ttyACM0', baudrate=1000000, enable_servo=True):
         """
         Args:
@@ -41,6 +44,11 @@ class ServoController:
         self.pan_cumulative_offset = 0
         self.tilt_cumulative_offset = 0
         self.roll_cumulative_offset = 0
+        
+        # 各軸が可動範囲の限界に達しているかのフラグ
+        self.pan_at_limit = False
+        self.tilt_at_limit = False
+        self.roll_at_limit = False
         
         if self.enable_servo:
             try:
@@ -100,10 +108,19 @@ class ServoController:
         if not self.enable_servo:
             return
         
-        # 累積オフセットに加算
-        self.pan_cumulative_offset += pan_delta
-        self.tilt_cumulative_offset += tilt_delta
-        self.roll_cumulative_offset += roll_delta
+        # サーボの負荷をチェック（可動範囲の限界検出）
+        self._check_servo_loads()
+        
+        # 累積オフセットに加算（パンとロールは方向が逆なので符号反転）
+        # ただし、限界に達している場合は逆方向にのみ動かせる
+        if not self.pan_at_limit or (self.pan_at_limit and pan_delta * self.pan_cumulative_offset < 0):
+            self.pan_cumulative_offset -= pan_delta
+        
+        if not self.tilt_at_limit or (self.tilt_at_limit and tilt_delta * self.tilt_cumulative_offset < 0):
+            self.tilt_cumulative_offset += tilt_delta
+        
+        if not self.roll_at_limit or (self.roll_at_limit and roll_delta * self.roll_cumulative_offset < 0):
+            self.roll_cumulative_offset -= roll_delta
         
         # 範囲外チェック用に元の値を保存
         original_pan = self.pan_cumulative_offset
@@ -140,6 +157,43 @@ class ServoController:
         except Exception as e:
             print(f"サーボ移動エラー: {e}")
     
+    def _check_servo_loads(self):
+        """各サーボの負荷をチェックして可動範囲の限界を検出"""
+        if not self.enable_servo:
+            return
+        
+        try:
+            # パンサーボの負荷チェック
+            pan_load = self.servo.ReadLoad(self.PAN_SERVO_ID)
+            if pan_load is not None and abs(pan_load) > self.MAX_LOAD_THRESHOLD:
+                if not self.pan_at_limit:
+                    print(f"警告: パンサーボが可動範囲の限界に達しました（負荷: {pan_load:.1f}%）")
+                    self.pan_at_limit = True
+            else:
+                self.pan_at_limit = False
+            
+            # チルトサーボの負荷チェック
+            tilt_load = self.servo.ReadLoad(self.TILT_SERVO_ID)
+            if tilt_load is not None and abs(tilt_load) > self.MAX_LOAD_THRESHOLD:
+                if not self.tilt_at_limit:
+                    print(f"警告: チルトサーボが可動範囲の限界に達しました（負荷: {tilt_load:.1f}%）")
+                    self.tilt_at_limit = True
+            else:
+                self.tilt_at_limit = False
+            
+            # ロールサーボの負荷チェック
+            roll_load = self.servo.ReadLoad(self.ROLL_SERVO_ID)
+            if roll_load is not None and abs(roll_load) > self.MAX_LOAD_THRESHOLD:
+                if not self.roll_at_limit:
+                    print(f"警告: ロールサーボが可動範囲の限界に達しました（負荷: {roll_load:.1f}%）")
+                    self.roll_at_limit = True
+            else:
+                self.roll_at_limit = False
+                
+        except Exception as e:
+            # 負荷読み取りエラーは無視（制御は継続）
+            pass
+    
     def get_current_positions(self):
         """現在のサーボ位置を取得"""
         if not self.enable_servo:
@@ -153,6 +207,52 @@ class ServoController:
         except Exception as e:
             print(f"位置読み取りエラー: {e}")
             return None, None, None
+    
+    def return_to_neutral_and_release(self):
+        """全サーボを中立位置に戻してトルクを無効化"""
+        if not self.enable_servo:
+            return
+        
+        servo_ids = [self.PAN_SERVO_ID, self.TILT_SERVO_ID, self.ROLL_SERVO_ID]
+        
+        # まず中立位置に移動
+        print("サーボを中立位置に移動中...")
+        try:
+            for servo_id in servo_ids:
+                self.servo.MoveTo(servo_id, self.CENTER_POSITION, speed=400, acc=10, wait=False)
+            # 移動完了まで待つ
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"サーボ移動エラー: {e}")
+        
+        # トルクを無効化
+        for servo_id in servo_ids:
+            try:
+                self.servo.StopServo(servo_id)
+            except Exception as e:
+                print(f"サーボID {servo_id} の停止エラー: {e}")
+        
+        # 累積オフセットをリセット
+        self.pan_cumulative_offset = 0
+        self.tilt_cumulative_offset = 0
+        self.roll_cumulative_offset = 0
+        
+        print("全サーボを中立位置に戻し、トルクを無効化しました")
+    
+    def resume_servos(self):
+        """サーボを再開（トルクを有効化）"""
+        if not self.enable_servo:
+            return
+        
+        servo_ids = [self.PAN_SERVO_ID, self.TILT_SERVO_ID, self.ROLL_SERVO_ID]
+        
+        for servo_id in servo_ids:
+            try:
+                self.servo.StartServo(servo_id)
+            except Exception as e:
+                print(f"サーボID {servo_id} の再開エラー: {e}")
+        
+        print("サーボを再開しました")
     
     def stop_all(self):
         """全サーボのトルクを無効化"""
@@ -223,8 +323,8 @@ class EyeTracker:
         self.roll_gain = 2.0  # ロールのゲイン
         
         # PD制御用のパラメータ
-        self.tilt_kp = 0.5    # 比例ゲイン
-        self.tilt_kd = 0.8    # 微分ゲイン（振動抑制）
+        self.tilt_kp = 0.3    # 比例ゲイン
+        self.tilt_kd = 1.0    # 微分ゲイン（振動抑制）
         self.pan_kp = 0.3     # パンの比例ゲイン（振動抑制のため低め）
         self.pan_kd = 1.2     # パンの微分ゲイン（振動抑制のため高め）
         self.roll_kp = 0.3    # ロールの比例ゲイン（振動抑制のため低め）
@@ -234,6 +334,11 @@ class EyeTracker:
         self.prev_pan_error = 0
         self.prev_tilt_error = 0
         self.prev_roll_error = 0
+        
+        # 顔検知失敗時の処理用
+        self.no_face_timeout = 10  # 秒（両目が検知できない状態が続いたら中立位置に戻す）
+        self.last_face_detected_time = time.time()  # 最後に顔が検知された時刻
+        self.servo_released = False  # サーボが開放されているか
         
         print("Eye Tracker 初期化完了")
         print(f"ディスプレイモード: {'ON' if display_mode else 'OFF'}")
@@ -420,11 +525,29 @@ class EyeTracker:
                     print("カメラからの読み込みに失敗しました")
                     break
                 
-                # カメラが上下逆に取り付けられているため、画像を上下反転
-                frame = cv2.flip(frame, 0)
-                
                 # 両目の位置を検出
                 left_pos, right_pos, center_pos = self.get_eye_positions(frame)
+                
+                # 顔検知の状態管理
+                current_time = time.time()
+                if left_pos and right_pos and center_pos:
+                    # 顔が検知された
+                    self.last_face_detected_time = current_time
+                    
+                    # サーボが開放されていたら再開
+                    if self.servo_released:
+                        print("両目を再検知しました。サーボを再開します。")
+                        self.servo_controller.resume_servos()
+                        self.servo_released = False
+                else:
+                    # 顔が検知されない
+                    time_since_last_face = current_time - self.last_face_detected_time
+                    
+                    # タイムアウト時間を超えたらサーボを中立位置に戻して開放
+                    if not self.servo_released and time_since_last_face >= self.no_face_timeout:
+                        print(f"両目が{self.no_face_timeout}秒間検知できませんでした。サーボを中立位置に戻して開放します。")
+                        self.servo_controller.return_to_neutral_and_release()
+                        self.servo_released = True
                 
                 # サーボのオフセットを計算
                 pan_offset, tilt_offset, roll_offset = self.calculate_servo_offsets(
@@ -432,8 +555,9 @@ class EyeTracker:
                 )
                 
                 # サーボを動かす（5フレームに1回だけ更新して制御周期を遅くする）
+                # サーボが開放されていない場合のみ動かす
                 frame_count += 1
-                if left_pos and right_pos and center_pos and frame_count % 5 == 0:
+                if left_pos and right_pos and center_pos and frame_count % 5 == 0 and not self.servo_released:
                     self.servo_controller.move_to_position(
                         pan_offset, tilt_offset, roll_offset
                     )
