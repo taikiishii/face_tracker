@@ -3,3 +3,4 @@ mediapipe>=0.10.14
 numpy>=2.2.0
 st3215>=0.3.0
 pyserial>=3.5
+psutil>=5.9.0

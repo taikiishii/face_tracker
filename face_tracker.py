@@ -10,6 +10,11 @@ import numpy as np
 import argparse
 import time
 import math
+import logging
+import psutil
+import os
+import traceback
+from datetime import datetime
 from st3215 import ST3215
 
 
@@ -279,6 +284,20 @@ class EyeTracker:
             servo_port: サーボのシリアルポート
         """
         self.display_mode = display_mode
+        self.logger = logging.getLogger(__name__)
+        
+        # リソース監視用
+        self.process = psutil.Process(os.getpid())
+        self.start_time = time.time()
+        self.frame_count_total = 0
+        self.error_count = 0
+        self.last_resource_check = time.time()
+        self.resource_check_interval = 300  # 5分ごとにリソースチェック
+        
+        # カメラエラー復旧用
+        self.consecutive_camera_errors = 0
+        self.max_consecutive_errors = 10
+        self.camera_reinit_count = 0
         
         # サーボコントローラーの初期化
         self.servo_controller = ServoController(
@@ -336,13 +355,77 @@ class EyeTracker:
         self.prev_roll_error = 0
         
         # 顔検知失敗時の処理用
-        self.no_face_timeout = 10  # 秒（両目が検知できない状態が続いたら中立位置に戻す）
+        self.no_face_timeout = 10.0  # 秒（両目が検知できない状態が続いたら中立位置に戻す）
         self.last_face_detected_time = time.time()  # 最後に顔が検知された時刻
         self.servo_released = False  # サーボが開放されているか
         
-        print("Eye Tracker 初期化完了")
-        print(f"ディスプレイモード: {'ON' if display_mode else 'OFF'}")
-        print(f"サーボ制御: {'ON' if enable_servo else 'OFF'}")
+        self.logger.info("Eye Tracker 初期化完了")
+        self.logger.info(f"ディスプレイモード: {'ON' if display_mode else 'OFF'}")
+        self.logger.info(f"サーボ制御: {'ON' if enable_servo else 'OFF'}")
+        self.logger.info(f"PID: {os.getpid()}")
+    
+    def check_resources(self):
+        """システムリソースをチェックしてログに記録"""
+        try:
+            current_time = time.time()
+            if current_time - self.last_resource_check < self.resource_check_interval:
+                return
+            
+            self.last_resource_check = current_time
+            uptime = current_time - self.start_time
+            
+            # メモリ使用量
+            memory_info = self.process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            
+            # CPU使用率
+            cpu_percent = self.process.cpu_percent(interval=0.1)
+            
+            # システム全体のメモリ
+            system_memory = psutil.virtual_memory()
+            
+            # ファイルディスクリプタ数
+            try:
+                num_fds = self.process.num_fds()
+            except:
+                num_fds = -1
+            
+            self.logger.info(
+                f"[リソース監視] 稼働時間: {uptime/3600:.1f}h, "
+                f"メモリ: {memory_mb:.1f}MB, CPU: {cpu_percent:.1f}%, "
+                f"システムメモリ: {system_memory.percent:.1f}%, "
+                f"FD: {num_fds}, フレーム数: {self.frame_count_total}, "
+                f"エラー数: {self.error_count}, カメラ再初期化: {self.camera_reinit_count}"
+            )
+            
+            # メモリ使用量が異常に高い場合は警告
+            if memory_mb > 500:
+                self.logger.warning(f"メモリ使用量が高い: {memory_mb:.1f}MB")
+            
+            # システムメモリが逼迫している場合は警告
+            if system_memory.percent > 90:
+                self.logger.warning(f"システムメモリが逼迫: {system_memory.percent:.1f}%")
+                
+        except Exception as e:
+            self.logger.error(f"リソースチェックエラー: {e}")
+    
+    def reinitialize_camera(self):
+        """カメラを再初期化"""
+        try:
+            self.logger.warning("カメラを再初期化します")
+            if self.cap is not None:
+                self.cap.release()
+            time.sleep(1)
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.camera_reinit_count += 1
+            self.consecutive_camera_errors = 0
+            self.logger.info("カメラの再初期化完了")
+            return True
+        except Exception as e:
+            self.logger.error(f"カメラ再初期化エラー: {e}")
+            return False
     
     def get_eye_positions(self, frame):
         """
@@ -352,35 +435,41 @@ class EyeTracker:
             tuple: (left_eye_pos, right_eye_pos, center_pos)
                    各posは(x, y)のタプル、検出失敗時はNone
         """
-        # BGR to RGB変換
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        try:
+            # BGR to RGB変換
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # 顔検出
+            results = self.face_mesh.process(rgb_frame)
+            
+            if not results.multi_face_landmarks:
+                return None, None, None
+            
+            # 最初の顔のランドマークを取得
+            face_landmarks = results.multi_face_landmarks[0]
+            
+            h, w = frame.shape[:2]
+            
+            # 左目中心座標
+            left_eye = face_landmarks.landmark[self.LEFT_EYE_CENTER]
+            left_pos = (int(left_eye.x * w), int(left_eye.y * h))
+            
+            # 右目中心座標
+            right_eye = face_landmarks.landmark[self.RIGHT_EYE_CENTER]
+            right_pos = (int(right_eye.x * w), int(right_eye.y * h))
+            
+            # 両目の中心点（顔の中心として使用）
+            center_pos = (
+                (left_pos[0] + right_pos[0]) // 2,
+                (left_pos[1] + right_pos[1]) // 2
+            )
+            
+            return left_pos, right_pos, center_pos
         
-        # 顔検出
-        results = self.face_mesh.process(rgb_frame)
-        
-        if not results.multi_face_landmarks:
+        except Exception as e:
+            self.logger.error(f"顔検出エラー: {e}")
+            self.error_count += 1
             return None, None, None
-        
-        # 最初の顔のランドマークを取得
-        face_landmarks = results.multi_face_landmarks[0]
-        
-        h, w = frame.shape[:2]
-        
-        # 左目中心座標
-        left_eye = face_landmarks.landmark[self.LEFT_EYE_CENTER]
-        left_pos = (int(left_eye.x * w), int(left_eye.y * h))
-        
-        # 右目中心座標
-        right_eye = face_landmarks.landmark[self.RIGHT_EYE_CENTER]
-        right_pos = (int(right_eye.x * w), int(right_eye.y * h))
-        
-        # 両目の中心点（顔の中心として使用）
-        center_pos = (
-            (left_pos[0] + right_pos[0]) // 2,
-            (left_pos[1] + right_pos[1]) // 2
-        )
-        
-        return left_pos, right_pos, center_pos
     
     def calculate_servo_offsets(self, left_pos, right_pos, center_pos):
         """
@@ -513,17 +602,37 @@ class EyeTracker:
     
     def run(self):
         """メインループ"""
-        print("プログラム開始。終了するにはESCキーまたはCtrl+Cを押してください。")
+        self.logger.info("プログラム開始。終了するにはESCキーまたはCtrl+Cを押してください。")
         
         frame_count = 0
         start_time = time.time()
         
         try:
             while True:
+                # リソースチェック
+                self.check_resources()
+                
                 ret, frame = self.cap.read()
                 if not ret:
-                    print("カメラからの読み込みに失敗しました")
-                    break
+                    self.logger.error("カメラからの読み込みに失敗しました")
+                    self.consecutive_camera_errors += 1
+                    self.error_count += 1
+                    
+                    # 連続エラーが一定数を超えたらカメラを再初期化
+                    if self.consecutive_camera_errors >= self.max_consecutive_errors:
+                        self.logger.warning(f"連続カメラエラー {self.consecutive_camera_errors} 回。再初期化を試みます")
+                        if not self.reinitialize_camera():
+                            self.logger.critical("カメラ再初期化失敗。プログラムを終了します")
+                            break
+                    
+                    time.sleep(0.1)
+                    continue
+                
+                # カメラ読み込み成功時はエラーカウントをリセット
+                self.consecutive_camera_errors = 0
+                
+                # フレームカウント
+                self.frame_count_total += 1
                 
                 # 両目の位置を検出
                 left_pos, right_pos, center_pos = self.get_eye_positions(frame)
@@ -536,7 +645,7 @@ class EyeTracker:
                     
                     # サーボが開放されていたら再開
                     if self.servo_released:
-                        print("両目を再検知しました。サーボを再開します。")
+                        self.logger.info("両目を再検知しました。サーボを再開します。")
                         self.servo_controller.resume_servos()
                         self.servo_released = False
                 else:
@@ -545,7 +654,7 @@ class EyeTracker:
                     
                     # タイムアウト時間を超えたらサーボを中立位置に戻して開放
                     if not self.servo_released and time_since_last_face >= self.no_face_timeout:
-                        print(f"両目が{self.no_face_timeout}秒間検知できませんでした。サーボを中立位置に戻して開放します。")
+                        self.logger.warning(f"両目が{self.no_face_timeout}秒間検知できませんでした。サーボを中立位置に戻して開放します。")
                         self.servo_controller.return_to_neutral_and_release()
                         self.servo_released = True
                 
@@ -567,12 +676,12 @@ class EyeTracker:
                     if frame_count % 30 == 0:  # 30フレームごとに出力
                         elapsed = time.time() - start_time
                         fps = frame_count / elapsed
-                        print(f"[{elapsed:.1f}s] 中心: {center_pos}, "
+                        self.logger.debug(f"[{elapsed:.1f}s] 中心: {center_pos}, "
                               f"サーボ: P={pan_offset} T={tilt_offset} R={roll_offset}, "
                               f"FPS: {fps:.1f}")
                 else:
-                    if frame_count % 30 == 0:
-                        print("顔が検出されませんでした")
+                    if frame_count % 300 == 0:  # 顔なしは頻度を下げる
+                        self.logger.debug("顔が検出されませんでした")
                 
                 # ディスプレイモードの場合、画面に表示
                 if self.display_mode:
@@ -581,7 +690,7 @@ class EyeTracker:
                     
                     # ESCキーで終了
                     if cv2.waitKey(1) & 0xFF == 27:
-                        print("ESCキーが押されました。終了します。")
+                        self.logger.info("ESCキーが押されました。終了します。")
                         break
                 else:
                     # ディスプレイなしモードでも処理を続ける
@@ -589,20 +698,78 @@ class EyeTracker:
                     time.sleep(0.01)  # CPU使用率を抑える
         
         except KeyboardInterrupt:
-            print("\nCtrl+Cが押されました。終了します。")
-        
+            self.logger.info("\nCtrl+Cが押されました。終了します。")
+        except Exception as e:
+            self.logger.critical(f"予期しないエラーが発生しました: {e}")
+            self.logger.critical(traceback.format_exc())
         finally:
             self.cleanup()
     
     def cleanup(self):
         """リソースの解放"""
-        # サーボを停止
-        self.servo_controller.stop_all()
+        self.logger.info("クリーンアップ開始")
         
-        self.cap.release()
-        if self.display_mode:
-            cv2.destroyAllWindows()
-        print("リソースを解放しました。")
+        try:
+            # サーボを停止
+            self.servo_controller.stop_all()
+        except Exception as e:
+            self.logger.error(f"サーボ停止エラー: {e}")
+        
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception as e:
+            self.logger.error(f"カメラ解放エラー: {e}")
+        
+        try:
+            if self.display_mode:
+                cv2.destroyAllWindows()
+        except Exception as e:
+            self.logger.error(f"ウィンドウ破棄エラー: {e}")
+        
+        # 最終統計を出力
+        uptime = time.time() - self.start_time
+        self.logger.info(
+            f"プログラム終了 - 稼働時間: {uptime/3600:.2f}h, "
+            f"総フレーム数: {self.frame_count_total}, "
+            f"エラー数: {self.error_count}, "
+            f"カメラ再初期化回数: {self.camera_reinit_count}"
+        )
+        self.logger.info("リソースを解放しました。")
+
+
+def setup_logging(log_file=None, log_level=logging.INFO):
+    """ロギング設定"""
+    # ログフォーマット
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    date_format = '%Y-%m-%d %H:%M:%S'
+    
+    # ルートロガーの設定
+    logging.basicConfig(
+        level=log_level,
+        format=log_format,
+        datefmt=date_format
+    )
+    
+    logger = logging.getLogger()
+    
+    # ファイルハンドラーの追加（ログファイルが指定されている場合）
+    if log_file:
+        try:
+            # ログファイルをローテーション（サイズ制限）
+            from logging.handlers import RotatingFileHandler
+            file_handler = RotatingFileHandler(
+                log_file,
+                maxBytes=10*1024*1024,  # 10MB
+                backupCount=5
+            )
+            file_handler.setFormatter(logging.Formatter(log_format, date_format))
+            logger.addHandler(file_handler)
+            logger.info(f"ログファイル: {log_file}")
+        except Exception as e:
+            logger.error(f"ログファイル作成エラー: {e}")
+    
+    return logger
 
 
 def main():
@@ -613,19 +780,41 @@ def main():
                        help='サーボなしモードで実行（テスト用）')
     parser.add_argument('--servo-port', type=str, default='/dev/ttyACM0',
                        help='サーボのシリアルポート（デフォルト: /dev/ttyACM0）')
+    parser.add_argument('--log-file', type=str, default='face_tracker.log',
+                       help='ログファイルのパス（デフォルト: face_tracker.log）')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                       help='ログレベル（デフォルト: INFO）')
     args = parser.parse_args()
+    
+    # ロギング設定
+    log_level = getattr(logging, args.log_level)
+    logger = setup_logging(log_file=args.log_file, log_level=log_level)
     
     # ディスプレイモードの判定
     display_mode = not args.no_display
     enable_servo = not args.no_servo
     
+    logger.info("="*60)
+    logger.info("Face Tracker 起動")
+    logger.info(f"起動時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"ディスプレイモード: {display_mode}")
+    logger.info(f"サーボ制御: {enable_servo}")
+    logger.info(f"サーボポート: {args.servo_port}")
+    logger.info("="*60)
+    
     # トラッカーの起動
-    tracker = EyeTracker(
-        display_mode=display_mode,
-        enable_servo=enable_servo,
-        servo_port=args.servo_port
-    )
-    tracker.run()
+    try:
+        tracker = EyeTracker(
+            display_mode=display_mode,
+            enable_servo=enable_servo,
+            servo_port=args.servo_port
+        )
+        tracker.run()
+    except Exception as e:
+        logger.critical(f"致命的エラー: {e}")
+        logger.critical(traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
